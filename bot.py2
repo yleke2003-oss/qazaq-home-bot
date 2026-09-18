@@ -1,0 +1,2182 @@
+import os
+import json
+import sqlite3
+from datetime import datetime, timedelta
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters,
+)
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+DB_NAME = "qazaq_home.db"
+
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+
+
+def db_execute(query, params=(), fetchone=False, fetchall=False):
+    cur = conn.cursor()
+    cur.execute(query, params)
+    conn.commit()
+
+    if fetchone:
+        return cur.fetchone()
+
+    if fetchall:
+        return cur.fetchall()
+
+    return cur.lastrowid
+
+
+def init_db():
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        language TEXT DEFAULT 'kk',
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS listings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        property_type TEXT,
+        deal_type TEXT,
+        city TEXT,
+        rooms TEXT,
+        address TEXT,
+        price TEXT,
+        allowed TEXT,
+        forbidden TEXT,
+        photos TEXT,
+        video TEXT,
+        phone TEXT,
+        extra TEXT,
+        created_at TEXT,
+        expires_at TEXT,
+        active INTEGER DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS roommate_profiles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        city TEXT,
+        age TEXT,
+        budget TEXT,
+        extra TEXT,
+        username TEXT,
+        created_at TEXT,
+        expires_at TEXT,
+        active INTEGER DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS saved (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        item_type TEXT,
+        item_id INTEGER,
+        UNIQUE(user_id, item_type, item_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS interactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        seller_id INTEGER,
+        buyer_id INTEGER,
+        listing_id INTEGER,
+        created_at TEXT,
+        seller_rated INTEGER DEFAULT 0,
+        buyer_rated INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS ratings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        interaction_id INTEGER,
+        from_user INTEGER,
+        to_user INTEGER,
+        rating_type TEXT,
+        stars INTEGER,
+        comment TEXT,
+        created_at TEXT,
+        UNIQUE(interaction_id, from_user)
+    );
+
+    CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reporter_id INTEGER,
+        item_type TEXT,
+        item_id INTEGER,
+        reason TEXT,
+        created_at TEXT,
+        status TEXT DEFAULT 'new'
+    );
+    """)
+
+    conn.commit()
+
+
+# =========================================================
+# USERS
+# =========================================================
+
+def register_user(user):
+    existing = db_execute(
+        "SELECT id FROM users WHERE id=?",
+        (user.id,),
+        fetchone=True
+    )
+
+    username = user.username or ""
+    first_name = user.first_name or ""
+
+    if existing:
+        db_execute(
+            "UPDATE users SET username=?, first_name=? WHERE id=?",
+            (username, first_name, user.id)
+        )
+    else:
+        db_execute(
+            """
+            INSERT INTO users
+            (id, username, first_name, language, created_at)
+            VALUES (?, ?, ?, 'kk', ?)
+            """,
+            (
+                user.id,
+                username,
+                first_name,
+                now()
+            )
+        )
+
+
+def get_language(user_id):
+    row = db_execute(
+        "SELECT language FROM users WHERE id=?",
+        (user_id,),
+        fetchone=True
+    )
+    return row["language"] if row else "kk"
+
+
+def set_language(user_id, lang):
+    db_execute(
+        "UPDATE users SET language=? WHERE id=?",
+        (lang, user_id)
+    )
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def now():
+    return datetime.utcnow().isoformat()
+
+
+def expires_in_14_days():
+    return (datetime.utcnow() + timedelta(days=14)).isoformat()
+
+
+def format_date(date_string):
+    try:
+        dt = datetime.fromisoformat(date_string)
+        return dt.strftime("%d.%m.%Y")
+    except Exception:
+        return date_string
+
+
+def clean_phone(phone):
+    if not phone:
+        return ""
+
+    phone = phone.replace(" ", "")
+    phone = phone.replace("-", "")
+    phone = phone.replace("(", "")
+    phone = phone.replace(")", "")
+
+    if phone.startswith("8"):
+        phone = "+7" + phone[1:]
+
+    if not phone.startswith("+"):
+        phone = "+" + phone
+
+    return phone
+
+
+def whatsapp_url(phone):
+    phone = clean_phone(phone)
+    digits = "".join(x for x in phone if x.isdigit())
+    return f"https://wa.me/{digits}"
+
+
+def main_menu(lang="kk"):
+    if lang == "ru":
+        buttons = [
+            ["🏠 ИСКАТЬ КВАРТИРУ"],
+            ["👥 ИСКАТЬ СОЖИТЕЛЯ"],
+            ["🧑‍💼 ПРОДАВЕЦ / АРЕНДОДАТЕЛЬ"],
+            ["❤️ СОХРАНЁННЫЕ"],
+            ["👤 МОЙ ПРОФИЛЬ"],
+            ["✨ РЕЙТИНГ", "⚙️ НАСТРОЙКИ"],
+        ]
+    else:
+        buttons = [
+            ["🏠 ПӘТЕР ІЗДЕУ"],
+            ["👥 БІРГЕ ПӘТЕР ІЗДЕУ"],
+            ["🧑‍💼 САТУШЫ / ЖАЛҒА БЕРУШІ"],
+            ["❤️ САҚТАЛҒАНДАР"],
+            ["👤 МЕНІҢ ПРОФИЛІМ"],
+            ["✨ РЕЙТИНГ", "⚙️ БАПТАУЛАР"],
+        ]
+
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+
+async def show_main_menu(update, context):
+    lang = get_language(update.effective_user.id)
+
+    text = (
+        "🏠 QAZAQ HOME\n\n"
+        "Қажетті бөлімді таңдаңыз:"
+        if lang == "kk"
+        else
+        "🏠 QAZAQ HOME\n\n"
+        "Выберите нужный раздел:"
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_menu(lang)
+    )
+
+
+# =========================================================
+# START / LANGUAGE
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    register_user(user)
+
+    row = db_execute(
+        "SELECT language FROM users WHERE id=?",
+        (user.id,),
+        fetchone=True
+    )
+
+    if row and row["language"] in ("kk", "ru"):
+        await show_main_menu(update, context)
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🇰🇿 ҚАЗАҚША", callback_data="lang_kk"),
+            InlineKeyboardButton("🇷🇺 РУССКИЙ", callback_data="lang_ru"),
+        ]
+    ]
+
+    await update.message.reply_text(
+        "ТІЛДІ ТАҢДАҢЫЗ\n\nВЫБЕРИТЕ ЯЗЫК",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def language_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    lang = query.data.replace("lang_", "")
+    set_language(query.from_user.id, lang)
+
+    await query.message.delete()
+
+    text = (
+        "Тіл таңдалды 🇰🇿\n\nҚош келдіңіз!"
+        if lang == "kk"
+        else
+        "Язык выбран 🇷🇺\n\nДобро пожаловать!"
+    )
+
+    await context.bot.send_message(
+        query.from_user.id,
+        text,
+        reply_markup=main_menu(lang)
+    )
+
+
+# =========================================================
+# SELLER LISTING
+# =========================================================
+
+SELL_TYPE = 1
+SELL_DEAL = 2
+SELL_CITY = 3
+SELL_ROOMS = 4
+SELL_ADDRESS = 5
+SELL_PRICE = 6
+SELL_ALLOWED = 7
+SELL_FORBIDDEN = 8
+SELL_PHOTOS = 9
+SELL_VIDEO = 10
+SELL_PHONE = 11
+SELL_EXTRA = 12
+
+
+async def seller_start(update, context):
+    context.user_data["listing"] = {}
+
+    keyboard = [
+        ["🏢 Пәтер жалға беремін"],
+        ["🏠 Үй жалға беремін"],
+        ["🏢 Пәтер сатамын"],
+        ["🏠 Үй сатамын"],
+    ]
+
+    await update.message.reply_text(
+        "🧑‍💼 ЖАРНАМА БЕРУ\n\n"
+        "Қандай жылжымайтын мүлік?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+
+    return SELL_TYPE
+
+
+async def seller_type(update, context):
+    text = update.message.text
+
+    if "Пәтер" in text:
+        property_type = "apartment"
+    else:
+        property_type = "house"
+
+    if "жалға" in text:
+        deal_type = "rent"
+    else:
+        deal_type = "sale"
+
+    context.user_data["listing"]["property_type"] = property_type
+    context.user_data["listing"]["deal_type"] = deal_type
+
+    await update.message.reply_text(
+        "📍 ҚАЛАНЫ ЖАЗЫҢЫЗ:"
+    )
+
+    return SELL_CITY
+
+
+async def seller_city(update, context):
+    context.user_data["listing"]["city"] = update.message.text
+
+    await update.message.reply_text(
+        "🚪 БӨЛМЕ САНЫ:\n\n"
+        "Мысалы: 1, 2, 3 немесе 4"
+    )
+
+    return SELL_ROOMS
+
+
+async def seller_rooms(update, context):
+    context.user_data["listing"]["rooms"] = update.message.text
+
+    await update.message.reply_text(
+        "📍 МЕКЕНЖАЙДЫ ЖАЗЫҢЫЗ:"
+    )
+
+    return SELL_ADDRESS
+
+
+async def seller_address(update, context):
+    context.user_data["listing"]["address"] = update.message.text
+
+    await update.message.reply_text(
+        "💰 БАҒАСЫ:"
+    )
+
+    return SELL_PRICE
+
+
+async def seller_price(update, context):
+    context.user_data["listing"]["price"] = update.message.text
+
+    await update.message.reply_text(
+        "✅ РҰҚСАТ ЕТІЛЕДІ:\n\n"
+        "Мысалы: балалар, жануарлар, темекі..."
+    )
+
+    return SELL_ALLOWED
+
+
+async def seller_allowed(update, context):
+    context.user_data["listing"]["allowed"] = update.message.text
+
+    await update.message.reply_text(
+        "❌ РҰҚСАТ ЖОҚ:\n\n"
+        "Мысалы: темекі, жануарлар..."
+    )
+
+    return SELL_FORBIDDEN
+
+
+async def seller_forbidden(update, context):
+    context.user_data["listing"]["forbidden"] = update.message.text
+
+    context.user_data["listing"]["photos"] = []
+
+    await update.message.reply_text(
+        "📸 ФОТОЛАРДЫ ЖІБЕРІҢІЗ.\n\n"
+        "Бірнеше фото жібере аласыз.\n"
+        "Дайын болғанда төмендегі батырманы басыңыз.",
+        reply_markup=ReplyKeyboardMarkup(
+            [["✅ ФОТОЛАР ДАЙЫН"]],
+            resize_keyboard=True
+        )
+    )
+
+    return SELL_PHOTOS
+
+
+async def seller_photos(update, context):
+    if update.message.text == "✅ ФОТОЛАР ДАЙЫН":
+        photos = context.user_data["listing"].get("photos", [])
+
+        if not photos:
+            await update.message.reply_text(
+                "⚠️ Кемінде 1 фото жіберіңіз."
+            )
+            return SELL_PHOTOS
+
+        await update.message.reply_text(
+            "🎥 ВИДЕО БАР МА?\n\n"
+            "Видео міндетті емес.",
+            reply_markup=ReplyKeyboardMarkup(
+                [["⏭ ВИДЕО ЖОҚ"]],
+                resize_keyboard=True
+            )
+        )
+
+        return SELL_VIDEO
+
+    if update.message.photo:
+        photo_id = update.message.photo[-1].file_id
+        context.user_data["listing"]["photos"].append(photo_id)
+
+        await update.message.reply_text(
+            "📸 Фото қосылды. Тағы фото жіберіңіз немесе «ФОТОЛАР ДАЙЫН» басыңыз."
+        )
+
+    return SELL_PHOTOS
+
+
+async def seller_video(update, context):
+    if update.message.text == "⏭ ВИДЕО ЖОҚ":
+        context.user_data["listing"]["video"] = ""
+    elif update.message.video:
+        context.user_data["listing"]["video"] = update.message.video.file_id
+    else:
+        await update.message.reply_text(
+            "Видео жіберіңіз немесе «ВИДЕО ЖОҚ» басыңыз."
+        )
+        return SELL_VIDEO
+
+    keyboard = [[
+        KeyboardButton(
+            "📞 НӨМІРДІ ЖІБЕРУ",
+            request_contact=True
+        )
+    ]]
+
+    await update.message.reply_text(
+        "📞 WHATSAPP НӨМІРІН ЖІБЕРІҢІЗ:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
+
+    return SELL_PHONE
+
+
+async def seller_phone(update, context):
+    phone = ""
+
+    if update.message.contact:
+        phone = update.message.contact.phone_number
+    else:
+        phone = update.message.text
+
+    context.user_data["listing"]["phone"] = clean_phone(phone)
+
+    await update.message.reply_text(
+        "📝 ҚОСЫМША АҚПАРАТ:\n\n"
+        "Егер қосымша ақпарат болмаса, «ЖОҚ» деп жазыңыз."
+    )
+
+    return SELL_EXTRA
+
+
+async def seller_extra(update, context):
+    context.user_data["listing"]["extra"] = update.message.text
+
+    listing = context.user_data["listing"]
+
+    property_name = "Пәтер" if listing["property_type"] == "apartment" else "Үй"
+    deal_name = "Жалға беру" if listing["deal_type"] == "rent" else "Сату"
+
+    text = (
+        "👀 ЖАРНАМАНЫ ҚАРАУ\n\n"
+        f"🏠 {property_name}\n"
+        f"🔄 {deal_name}\n"
+        f"📍 Қала: {listing['city']}\n"
+        f"🚪 Бөлме: {listing['rooms']}\n"
+        f"📍 Мекенжай: {listing['address']}\n"
+        f"💰 Баға: {listing['price']}\n"
+        f"✅ Рұқсат: {listing['allowed']}\n"
+        f"❌ Рұқсат жоқ: {listing['forbidden']}\n"
+        f"📸 Фото: {len(listing['photos'])} дана\n"
+        f"🎥 Видео: {'бар' if listing.get('video') else 'жоқ'}\n"
+        f"📝 {listing['extra']}\n\n"
+        "Жарнама 14 күнге жарияланады."
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✏️ ӨЗГЕРТУ", callback_data="listing_edit")
+        ],
+        [
+            InlineKeyboardButton("✅ ЖАРИЯЛАУ", callback_data="listing_publish"),
+            InlineKeyboardButton("❌ БОЛДЫРМАУ", callback_data="listing_cancel"),
+        ]
+    ]
+
+    await update.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML"
+    )
+
+    return ConversationHandler.END
+
+
+async def publish_listing(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    listing = context.user_data.get("listing")
+
+    if not listing:
+        await query.message.reply_text("❌ Жарнама табылмады.")
+        return
+
+    db_execute(
+        """
+        INSERT INTO listings
+        (
+            user_id, property_type, deal_type, city, rooms,
+            address, price, allowed, forbidden, photos,
+            video, phone, extra, created_at, expires_at, active
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """,
+        (
+            query.from_user.id,
+            listing["property_type"],
+            listing["deal_type"],
+            listing["city"],
+            listing["rooms"],
+            listing["address"],
+            listing["price"],
+            listing["allowed"],
+            listing["forbidden"],
+            json.dumps(listing["photos"]),
+            listing.get("video", ""),
+            listing["phone"],
+            listing["extra"],
+            now(),
+            expires_in_14_days(),
+        )
+    )
+
+    context.user_data.pop("listing", None)
+
+    await query.message.edit_text(
+        "✅ ЖАРНАМА ЖАРИЯЛАНДЫ!\n\n"
+        "Жарнама 14 күн белсенді болады.\n"
+        "Мерзімі біткенде сізге ескерту жіберіледі."
+    )
+
+
+async def cancel_listing(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data.pop("listing", None)
+
+    await query.message.edit_text(
+        "❌ Жарнама жарияланбады."
+    )
+
+
+# =========================================================
+# SEARCH LISTINGS
+# =========================================================
+
+SEARCH_TYPE = 20
+SEARCH_CITY = 21
+
+
+async def search_start(update, context):
+    keyboard = [
+        ["🏢 ПӘТЕР ІЗДЕУ"],
+        ["🏠 ҮЙ ІЗДЕУ"],
+    ]
+
+    await update.message.reply_text(
+        "🏠 НЕ ІЗДЕЙСІЗ?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
+        )
+    )
+
+    return SEARCH_TYPE
+
+
+async def search_type(update, context):
+    text = update.message.text
+
+    if "ПӘТЕР" in text:
+        context.user_data["search_property"] = "apartment"
+    else:
+        context.user_data["search_property"] = "house"
+
+    await update.message.reply_text(
+        "📍 ҚАЛАНЫ ЖАЗЫҢЫЗ:"
+    )
+
+    return SEARCH_CITY
+
+
+async def search_city(update, context):
+    city = update.message.text.strip()
+
+    context.user_data["search_city"] = city
+
+    await show_next_listing(update, context, first=True)
+
+    return ConversationHandler.END
+
+
+async def show_next_listing(update, context, first=False):
+    user_id = update.effective_user.id
+
+    property_type = context.user_data.get("search_property")
+    city = context.user_data.get("search_city")
+
+    rows = db_execute(
+        """
+        SELECT * FROM listings
+        WHERE active=1
+        AND property_type=?
+        AND lower(city)=lower(?)
+        AND datetime(expires_at) > datetime('now')
+        ORDER BY
+            (
+                SELECT COALESCE(AVG(r.stars), 0)
+                FROM ratings r
+                JOIN interactions i ON i.id=r.interaction_id
+                WHERE r.to_user=listings.user_id
+                AND r.rating_type='seller'
+            ) DESC,
+            listings.id DESC
+        """,
+        (property_type, city),
+        fetchall=True
+    )
+
+    index = context.user_data.get("listing_index", 0)
+
+    if not rows or index >= len(rows):
+        await send_text(
+            update,
+            "😔 Бұл қалада әзірге сәйкес жарнама жоқ."
+        )
+        return
+
+    listing = rows[index]
+
+    context.user_data["current_listing_id"] = listing["id"]
+    context.user_data["listing_index"] = index + 1
+
+    property_name = "🏢 Пәтер" if listing["property_type"] == "apartment" else "🏠 Үй"
+
+    text = (
+        f"{property_name}\n\n"
+        f"📍 {listing['city']}\n"
+        f"🚪 Бөлме: {listing['rooms']}\n"
+        f"📍 Мекенжай: {listing['address']}\n"
+        f"💰 Баға: {listing['price']}\n"
+        f"✅ Рұқсат: {listing['allowed']}\n"
+        f"❌ Рұқсат жоқ: {listing['forbidden']}\n"
+        f"📝 {listing['extra']}\n\n"
+        f"📅 Жарамды: {format_date(listing['expires_at'])}"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("⏭ ӨТКІЗУ", callback_data="listing_skip"),
+            InlineKeyboardButton("❤️ САҚТАУ", callback_data="listing_save"),
+        ],
+        [
+            InlineKeyboardButton("✅ ТАҢДАУ", callback_data="listing_select")
+        ]
+    ]
+
+    photos = json.loads(listing["photos"] or "[]")
+
+    if photos:
+        try:
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=photos[0],
+                caption=text
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=text
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=text
+        )
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="👇 Таңдаңыз:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def listing_skip(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    await show_next_listing(query, context)
+
+
+async def listing_save(update, context):
+    query = update.callback_query
+    await query.answer("❤️ Сақталды!")
+
+    listing_id = context.user_data.get("current_listing_id")
+
+    if listing_id:
+        db_execute(
+            """
+            INSERT OR IGNORE INTO saved
+            (user_id, item_type, item_id)
+            VALUES (?, 'listing', ?)
+            """,
+            (query.from_user.id, listing_id)
+        )
+
+
+async def listing_select(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    listing_id = context.user_data.get("current_listing_id")
+
+    if not listing_id:
+        return
+
+    listing = db_execute(
+        "SELECT * FROM listings WHERE id=?",
+        (listing_id,),
+        fetchone=True
+    )
+
+    if not listing:
+        await query.message.reply_text("❌ Жарнама табылмады.")
+        return
+
+    seller_id = listing["user_id"]
+    buyer_id = query.from_user.id
+
+    if seller_id == buyer_id:
+        await query.message.reply_text(
+            "Бұл өзіңіздің жарнамаңыз."
+        )
+        return
+
+    db_execute(
+        """
+        INSERT INTO interactions
+        (seller_id, buyer_id, listing_id, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            seller_id,
+            buyer_id,
+            listing_id,
+            now()
+        )
+    )
+
+    phone = listing["phone"]
+
+    await query.message.reply_text(
+        "✅ СІЗ ЖАРНАМАНЫ ТАҢДАДЫҢЫЗ!\n\n"
+        "Енді сатушымен WhatsApp арқылы байланыса аласыз."
+    )
+
+    await query.message.reply_text(
+        "📞 WHATSAPP:",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "💬 WHATSAPP-ҚА ЖАЗУ",
+                    url=whatsapp_url(phone)
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# ROOMMATE
+# =========================================================
+
+ROOM_CITY = 30
+ROOM_AGE = 31
+ROOM_BUDGET = 32
+ROOM_EXTRA = 33
+
+
+async def roommate_start(update, context):
+    keyboard = [
+        ["🔎 ІЗДЕУ"],
+        ["📝 АНКЕТА ҚАЛДЫРУ"],
+    ]
+
+    await update.message.reply_text(
+        "👥 БІРГЕ ПӘТЕР ІЗДЕУ",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
+        )
+    )
+
+    return ConversationHandler.END
+
+
+async def roommate_menu(update, context):
+    text = update.message.text
+
+    if text == "📝 АНКЕТА ҚАЛДЫРУ":
+        await update.message.reply_text(
+            "📍 ҚАЛА:"
+        )
+        return ROOM_CITY
+
+    if text == "🔎 ІЗДЕУ":
+        await update.message.reply_text(
+            "📍 ҚАЙ ҚАЛАДАН ІЗДЕЙСІЗ?"
+        )
+        context.user_data["room_search"] = True
+        return ROOM_CITY
+
+    return ConversationHandler.END
+
+
+async def roommate_city(update, context):
+    city = update.message.text.strip()
+
+    if context.user_data.get("room_search"):
+        context.user_data["room_city"] = city
+        context.user_data["room_index"] = 0
+
+        await show_next_roommate(update, context)
+        return ConversationHandler.END
+
+    context.user_data["room"] = {
+        "city": city
+    }
+
+    await update.message.reply_text(
+        "🎂 ЖАСЫҢЫЗ:"
+    )
+
+    return ROOM_AGE
+
+
+async def roommate_age(update, context):
+    context.user_data["room"]["age"] = update.message.text
+
+    await update.message.reply_text(
+        "💰 БЮДЖЕТІҢІЗ:"
+    )
+
+    return ROOM_BUDGET
+
+
+async def roommate_budget(update, context):
+    context.user_data["room"]["budget"] = update.message.text
+
+    await update.message.reply_text(
+        "📝 ҚОСЫМША АҚПАРАТ:\n\n"
+        "Мысалы: жұмыс істеймін, темекі шекпеймін және т.б."
+    )
+
+    return ROOM_EXTRA
+
+
+async def roommate_extra(update, context):
+    room = context.user_data["room"]
+    room["extra"] = update.message.text
+
+    username = update.effective_user.username
+
+    if not username:
+        await update.message.reply_text(
+            "⚠️ Анкета жариялау үшін Telegram username қажет.\n\n"
+            "Telegram → Settings → Username арқылы username қойыңыз."
+        )
+        return ConversationHandler.END
+
+    room["username"] = username
+
+    text = (
+        "👀 АНКЕТАНЫ ҚАРАУ\n\n"
+        f"📍 Қала: {room['city']}\n"
+        f"🎂 Жасы: {room['age']}\n"
+        f"💰 Бюджет: {room['budget']}\n"
+        f"📝 {room['extra']}\n"
+        f"👤 Telegram: @{username}\n\n"
+        "Анкета 14 күнге жарияланады."
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "✏️ ӨЗГЕРТУ",
+                callback_data="room_edit"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✅ ЖАРИЯЛАУ",
+                callback_data="room_publish"
+            ),
+            InlineKeyboardButton(
+                "❌ БОЛДЫРМАУ",
+                callback_data="room_cancel"
+            )
+        ]
+    ]
+
+    await update.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    return ConversationHandler.END
+
+
+async def publish_roommate(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    room = context.user_data.get("room")
+
+    if not room:
+        return
+
+    db_execute(
+        """
+        INSERT INTO roommate_profiles
+        (user_id, city, age, budget, extra, username,
+         created_at, expires_at, active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """,
+        (
+            query.from_user.id,
+            room["city"],
+            room["age"],
+            room["budget"],
+            room["extra"],
+            room["username"],
+            now(),
+            expires_in_14_days()
+        )
+    )
+
+    context.user_data.pop("room", None)
+
+    await query.message.edit_text(
+        "✅ АНКЕТА ЖАРИЯЛАНДЫ!\n\n"
+        "14 күн белсенді болады."
+    )
+
+
+async def cancel_roommate(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data.pop("room", None)
+
+    await query.message.edit_text(
+        "❌ Анкета жарияланбады."
+    )
+
+
+async def show_next_roommate(update, context):
+    city = context.user_data.get("room_city")
+    index = context.user_data.get("room_index", 0)
+
+    rows = db_execute(
+        """
+        SELECT * FROM roommate_profiles
+        WHERE active=1
+        AND lower(city)=lower(?)
+        AND datetime(expires_at) > datetime('now')
+        ORDER BY id DESC
+        """,
+        (city,),
+        fetchall=True
+    )
+
+    if not rows or index >= len(rows):
+        await send_text(
+            update,
+            "😔 Бұл қалада әзірге анкета жоқ."
+        )
+        return
+
+    row = rows[index]
+
+    context.user_data["current_room_id"] = row["id"]
+    context.user_data["room_index"] = index + 1
+
+    text = (
+        "👥 БІРГЕ ПӘТЕР ІЗДЕУШІ\n\n"
+        f"📍 Қала: {row['city']}\n"
+        f"🎂 Жасы: {row['age']}\n"
+        f"💰 Бюджет: {row['budget']}\n"
+        f"📝 {row['extra']}\n"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "⏭ ӨТКІЗУ",
+                callback_data="room_skip"
+            ),
+            InlineKeyboardButton(
+                "❤️ САҚТАУ",
+                callback_data="room_save"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✅ ТАҢДАУ",
+                callback_data="room_select"
+            )
+        ]
+    ]
+
+    await context.bot.send_message(
+        chat_id=update.effective_user.id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def room_skip(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    await show_next_roommate(query, context)
+
+
+async def room_save(update, context):
+    query = update.callback_query
+    await query.answer("❤️ Сақталды!")
+
+    room_id = context.user_data.get("current_room_id")
+
+    if room_id:
+        db_execute(
+            """
+            INSERT OR IGNORE INTO saved
+            (user_id, item_type, item_id)
+            VALUES (?, 'roommate', ?)
+            """,
+            (query.from_user.id, room_id)
+        )
+
+
+async def room_select(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    room_id = context.user_data.get("current_room_id")
+
+    row = db_execute(
+        """
+        SELECT * FROM roommate_profiles
+        WHERE id=?
+        """,
+        (room_id,),
+        fetchone=True
+    )
+
+    if not row:
+        return
+
+    username = row["username"]
+
+    await query.message.reply_text(
+        f"👤 Telegram: @{username}\n\n"
+        "Байланысу үшін төмендегі батырманы басыңыз.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "💬 TELEGRAM-ҒА ЖАЗУ",
+                    url=f"https://t.me/{username}"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# SAVED
+# =========================================================
+
+async def saved_menu(update, context):
+    user_id = update.effective_user.id
+
+    rows = db_execute(
+        """
+        SELECT * FROM saved
+        WHERE user_id=?
+        ORDER BY id DESC
+        """,
+        (user_id,),
+        fetchall=True
+    )
+
+    if not rows:
+        await update.message.reply_text(
+            "❤️ Сақталғандар әзірге бос."
+        )
+        return
+
+    text = "❤️ САҚТАЛҒАНДАР\n\n"
+
+    for i, row in enumerate(rows, 1):
+        if row["item_type"] == "listing":
+            item = db_execute(
+                "SELECT * FROM listings WHERE id=?",
+                (row["item_id"],),
+                fetchone=True
+            )
+
+            if item:
+                text += (
+                    f"{i}. 🏠 {item['city']} — "
+                    f"{item['price']}\n"
+                )
+
+        elif row["item_type"] == "roommate":
+            item = db_execute(
+                "SELECT * FROM roommate_profiles WHERE id=?",
+                (row["item_id"],),
+                fetchone=True
+            )
+
+            if item:
+                text += (
+                    f"{i}. 👥 {item['city']} — "
+                    f"{item['budget']}\n"
+                )
+
+    await update.message.reply_text(text)
+
+
+# =========================================================
+# PROFILE / RATINGS
+# =========================================================
+
+async def profile_menu(update, context):
+    keyboard = [
+        ["📞 АДМИНМЕН ХАБАРЛАСУ"],
+        ["⭐ МЕНІҢ РЕЙТИНГІМ"],
+    ]
+
+    await update.message.reply_text(
+        "👤 МЕНІҢ ПРОФИЛІМ",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard,
+            resize_keyboard=True
+        )
+    )
+
+
+async def my_rating(update, context):
+    user_id = update.effective_user.id
+
+    seller = db_execute(
+        """
+        SELECT AVG(stars) avg_rating, COUNT(*) cnt
+        FROM ratings
+        WHERE to_user=? AND rating_type='seller'
+        """,
+        (user_id,),
+        fetchone=True
+    )
+
+    buyer = db_execute(
+        """
+        SELECT AVG(stars) avg_rating, COUNT(*) cnt
+        FROM ratings
+        WHERE to_user=? AND rating_type='buyer'
+        """,
+        (user_id,),
+        fetchone=True
+    )
+
+    seller_rating = round(seller["avg_rating"], 1) if seller["avg_rating"] else 0
+    buyer_rating = round(buyer["avg_rating"], 1) if buyer["avg_rating"] else 0
+
+    text = (
+        "⭐ МЕНІҢ РЕЙТИНГІМ\n\n"
+        f"🏠 САТУШЫ РЕЙТИНГІ\n"
+        f"⭐ {seller_rating} / 5\n"
+        f"{seller['cnt']} бағалау\n\n"
+        f"🔎 САТЫП АЛУШЫ РЕЙТИНГІ\n"
+        f"⭐ {buyer_rating} / 5\n"
+        f"{buyer['cnt']} бағалау"
+    )
+
+    await update.message.reply_text(text)
+
+
+async def rating_menu(update, context):
+    await my_rating(update, context)
+
+
+async def admin_contact(update, context):
+    if ADMIN_ID:
+        await update.message.reply_text(
+            "📞 Админмен байланысу:\n\n"
+            f"https://t.me/{(await context.bot.get_chat(ADMIN_ID)).username or ''}"
+        )
+    else:
+        await update.message.reply_text(
+            "📞 Админмен байланыс функциясы кейін бапталады."
+        )
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+async def settings_menu(update, context):
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🇰🇿 ҚАЗАҚША",
+                callback_data="setlang_kk"
+            ),
+            InlineKeyboardButton(
+                "🇷🇺 РУССКИЙ",
+                callback_data="setlang_ru"
+            )
+        ]
+    ]
+
+    await update.message.reply_text(
+        "⚙️ БАПТАУЛАР\n\nТілді таңдаңыз:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def settings_language(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    lang = query.data.replace("setlang_", "")
+
+    set_language(query.from_user.id, lang)
+
+    await query.message.edit_text(
+        "✅ Тіл өзгертілді."
+        if lang == "kk"
+        else
+        "✅ Язык изменён."
+    )
+
+
+# =========================================================
+# RATING
+# =========================================================
+
+async def rating_candidates(update, context):
+    user_id = update.effective_user.id
+
+    rows = db_execute(
+        """
+        SELECT *
+        FROM interactions
+        WHERE
+        (seller_id=? AND buyer_rated=0)
+        OR
+        (buyer_id=? AND seller_rated=0)
+        ORDER BY id DESC
+        """,
+        (user_id, user_id),
+        fetchall=True
+    )
+
+    if not rows:
+        await update.message.reply_text(
+            "⭐ Қазір бағалайтын адам жоқ."
+        )
+        return
+
+    for row in rows:
+        if row["seller_id"] == user_id:
+            target_id = row["buyer_id"]
+            rating_type = "buyer"
+            label = "🔎 САТЫП АЛУШЫНЫ БАҒАЛАУ"
+        else:
+            target_id = row["seller_id"]
+            rating_type = "seller"
+            label = "🏠 САТУШЫНЫ БАҒАЛАУ"
+
+        target = db_execute(
+            "SELECT first_name, username FROM users WHERE id=?",
+            (target_id,),
+            fetchone=True
+        )
+
+        if not target:
+            continue
+
+        name = target["first_name"] or target["username"] or "Қолданушы"
+
+        keyboard = [
+            [
+                InlineKeyboardButton("⭐", callback_data=f"rate_{row['id']}_{target_id}_{rating_type}_1"),
+                InlineKeyboardButton("⭐⭐", callback_data=f"rate_{row['id']}_{target_id}_{rating_type}_2"),
+                InlineKeyboardButton("⭐⭐⭐", callback_data=f"rate_{row['id']}_{target_id}_{rating_type}_3"),
+            ],
+            [
+                InlineKeyboardButton("⭐⭐⭐⭐", callback_data=f"rate_{row['id']}_{target_id}_{rating_type}_4"),
+                InlineKeyboardButton("⭐⭐⭐⭐⭐", callback_data=f"rate_{row['id']}_{target_id}_{rating_type}_5"),
+            ]
+        ]
+
+        await update.message.reply_text(
+            f"{label}\n\n"
+            f"👤 {name}\n\n"
+            "Бағаңызды таңдаңыз:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+
+async def rate_user(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split("_")
+
+    interaction_id = int(parts[1])
+    target_id = int(parts[2])
+    rating_type = parts[3]
+    stars = int(parts[4])
+
+    interaction = db_execute(
+        "SELECT * FROM interactions WHERE id=?",
+        (interaction_id,),
+        fetchone=True
+    )
+
+    if not interaction:
+        await query.message.reply_text(
+            "❌ Байланыс табылмады."
+        )
+        return
+
+    if query.from_user.id not in (
+        interaction["seller_id"],
+        interaction["buyer_id"]
+    ):
+        await query.message.reply_text(
+            "❌ Бұл рейтинг сізге арналмаған."
+        )
+        return
+
+    try:
+        db_execute(
+            """
+            INSERT INTO ratings
+            (interaction_id, from_user, to_user,
+             rating_type, stars, comment, created_at)
+            VALUES (?, ?, ?, ?, ?, '', ?)
+            """,
+            (
+                interaction_id,
+                query.from_user.id,
+                target_id,
+                rating_type,
+                stars,
+                now()
+            )
+        )
+    except sqlite3.IntegrityError:
+        await query.message.edit_text(
+            "⚠️ Сіз бұл адамға бұрын рейтинг қойғансыз."
+        )
+        return
+
+    if query.from_user.id == interaction["seller_id"]:
+        db_execute(
+            "UPDATE interactions SET buyer_rated=1 WHERE id=?",
+            (interaction_id,)
+        )
+    else:
+        db_execute(
+            "UPDATE interactions SET seller_rated=1 WHERE id=?",
+            (interaction_id,)
+        )
+
+    await query.message.edit_text(
+        f"✅ Рейтинг қойылды: {'⭐' * stars}"
+    )
+
+
+# =========================================================
+# REPORT
+# =========================================================
+
+async def report_listing(update, context):
+    listing_id = context.user_data.get("current_listing_id")
+
+    if not listing_id:
+        await update.message.reply_text(
+            "Жарнама таңдалмаған."
+        )
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "❌ Жалған жарнама",
+                callback_data=f"report_{listing_id}_fake"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⚠️ Ақпарат дұрыс емес",
+                callback_data=f"report_{listing_id}_wrong"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🚨 Күдікті",
+                callback_data=f"report_{listing_id}_danger"
+            )
+        ]
+    ]
+
+    await update.message.reply_text(
+        "🚨 ШАҒЫМ СЕБЕБІ:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def report_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    _, listing_id, reason = query.data.split("_", 2)
+
+    db_execute(
+        """
+        INSERT INTO reports
+        (reporter_id, item_type, item_id, reason, created_at)
+        VALUES (?, 'listing', ?, ?, ?)
+        """,
+        (
+            query.from_user.id,
+            int(listing_id),
+            reason,
+            now()
+        )
+    )
+
+    await query.message.edit_text(
+        "✅ Шағым админге жіберілді."
+    )
+
+
+# =========================================================
+# ADMIN
+# =========================================================
+
+async def admin_panel(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "👥 ҚОЛДАНУШЫЛАР",
+                callback_data="admin_users"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 ЖАРНАМАЛАР",
+                callback_data="admin_listings"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 АНКЕТАЛАР",
+                callback_data="admin_rooms"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🚨 ШАҒЫМДАР",
+                callback_data="admin_reports"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 СТАТИСТИКА",
+                callback_data="admin_stats"
+            )
+        ]
+    ]
+
+    await update.message.reply_text(
+        "🔐 АДМИН ПАНЕЛЬ",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def admin_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        return
+
+    action = query.data
+
+    if action == "admin_users":
+        row = db_execute(
+            "SELECT COUNT(*) cnt FROM users",
+            fetchone=True
+        )
+
+        await query.message.reply_text(
+            f"👥 Қолданушылар: {row['cnt']}"
+        )
+
+    elif action == "admin_listings":
+        row = db_execute(
+            "SELECT COUNT(*) cnt FROM listings WHERE active=1",
+            fetchone=True
+        )
+
+        await query.message.reply_text(
+            f"🏠 Белсенді жарнамалар: {row['cnt']}"
+        )
+
+    elif action == "admin_rooms":
+        row = db_execute(
+            "SELECT COUNT(*) cnt FROM roommate_profiles WHERE active=1",
+            fetchone=True
+        )
+
+        await query.message.reply_text(
+            f"👥 Белсенді анкеталар: {row['cnt']}"
+        )
+
+    elif action == "admin_reports":
+        row = db_execute(
+            "SELECT COUNT(*) cnt FROM reports WHERE status='new'",
+            fetchone=True
+        )
+
+        await query.message.reply_text(
+            f"🚨 Жаңа шағымдар: {row['cnt']}"
+        )
+
+    elif action == "admin_stats":
+        users = db_execute(
+            "SELECT COUNT(*) cnt FROM users",
+            fetchone=True
+        )
+
+        listings = db_execute(
+            "SELECT COUNT(*) cnt FROM listings",
+            fetchone=True
+        )
+
+        ratings = db_execute(
+            "SELECT COUNT(*) cnt FROM ratings",
+            fetchone=True
+        )
+
+        await query.message.reply_text(
+            "📊 СТАТИСТИКА\n\n"
+            f"👥 Қолданушылар: {users['cnt']}\n"
+            f"🏠 Барлық жарнама: {listings['cnt']}\n"
+            f"⭐ Бағалаулар: {ratings['cnt']}"
+        )
+
+
+# =========================================================
+# EXPIRATION
+# =========================================================
+
+async def check_expired(context):
+    expired = db_execute(
+        """
+        SELECT * FROM listings
+        WHERE active=1
+        AND datetime(expires_at) <= datetime('now')
+        """,
+        fetchall=True
+    )
+
+    for listing in expired:
+        db_execute(
+            "UPDATE listings SET active=0 WHERE id=?",
+            (listing["id"],)
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=listing["user_id"],
+                text=(
+                    "⚠️ СІЗДІҢ ЖАРНАМАҢЫЗДЫҢ МЕРЗІМІ АЯҚТАЛДЫ.\n\n"
+                    "Жарнаманы тағы 14 күнге ұзартқыңыз келе ме?"
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🔄 ҰЗАРТУ",
+                            callback_data=f"renew_{listing['id']}"
+                        ),
+                        InlineKeyboardButton(
+                            "🗑 ӨШІРУ",
+                            callback_data=f"delete_expired_{listing['id']}"
+                        )
+                    ]
+                ])
+            )
+        except Exception:
+            pass
+
+    expired_rooms = db_execute(
+        """
+        SELECT * FROM roommate_profiles
+        WHERE active=1
+        AND datetime(expires_at) <= datetime('now')
+        """,
+        fetchall=True
+    )
+
+    for profile in expired_rooms:
+        db_execute(
+            "UPDATE roommate_profiles SET active=0 WHERE id=?",
+            (profile["id"],)
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=profile["user_id"],
+                text=(
+                    "⚠️ Сіздің анкетаңыздың мерзімі аяқталды.\n\n"
+                    "Тағы 14 күнге ұзартқыңыз келе ме?"
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🔄 ҰЗАРТУ",
+                            callback_data=f"renewroom_{profile['id']}"
+                        )
+                    ]
+                ])
+            )
+        except Exception:
+            pass
+
+
+async def renew_listing(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    listing_id = int(query.data.split("_")[1])
+
+    db_execute(
+        """
+        UPDATE listings
+        SET active=1,
+            expires_at=?
+        WHERE id=? AND user_id=?
+        """,
+        (
+            expires_in_14_days(),
+            listing_id,
+            query.from_user.id
+        )
+    )
+
+    await query.message.edit_text(
+        "✅ Жарнама тағы 14 күнге ұзартылды."
+    )
+
+
+async def delete_expired(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    listing_id = int(query.data.split("_")[2])
+
+    db_execute(
+        """
+        DELETE FROM listings
+        WHERE id=? AND user_id=?
+        """,
+        (
+            listing_id,
+            query.from_user.id
+        )
+    )
+
+    await query.message.edit_text(
+        "🗑 Жарнама өшірілді."
+    )
+
+
+async def renew_roommate(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    profile_id = int(query.data.split("_")[1])
+
+    db_execute(
+        """
+        UPDATE roommate_profiles
+        SET active=1,
+            expires_at=?
+        WHERE id=? AND user_id=?
+        """,
+        (
+            expires_in_14_days(),
+            profile_id,
+            query.from_user.id
+        )
+    )
+
+    await query.message.edit_text(
+        "✅ Анкета тағы 14 күнге ұзартылды."
+    )
+
+
+# =========================================================
+# TEXT ROUTER
+# =========================================================
+
+async def send_text(update, text):
+    if hasattr(update, "message") and update.message:
+        await update.message.reply_text(text)
+    else:
+        await update.get_bot().send_message(
+            chat_id=update.effective_user.id,
+            text=text
+        )
+
+
+async def text_router(update, context):
+    text = update.message.text
+
+    if text == "🏠 ПӘТЕР ІЗДЕУ":
+        context.user_data["listing_index"] = 0
+
+        conv = context.application.bot_data.get("search_conv")
+        await search_start(update, context)
+        return
+
+    if text == "👥 БІРГЕ ПӘТЕР ІЗДЕУ":
+        await roommate_start(update, context)
+        return
+
+    if text == "🧑‍💼 САТУШЫ / ЖАЛҒА БЕРУШІ":
+        await seller_start(update, context)
+        return
+
+    if text == "❤️ САҚТАЛҒАНДАР":
+        await saved_menu(update, context)
+        return
+
+    if text == "👤 МЕНІҢ ПРОФИЛІМ":
+        await profile_menu(update, context)
+        return
+
+    if text == "✨ РЕЙТИНГ":
+        await rating_candidates(update, context)
+        return
+
+    if text == "⭐ МЕНІҢ РЕЙТИНГІМ":
+        await my_rating(update, context)
+        return
+
+    if text == "📞 АДМИНМЕН ХАБАРЛАСУ":
+        await admin_contact(update, context)
+        return
+
+    if text == "⚙️ БАПТАУЛАР":
+        await settings_menu(update, context)
+        return
+
+    if text == "🇰🇿 ҚАЗАҚША":
+        set_language(update.effective_user.id, "kk")
+        await show_main_menu(update, context)
+        return
+
+    if text == "🇷🇺 РУССКИЙ":
+        set_language(update.effective_user.id, "ru")
+        await show_main_menu(update, context)
+        return
+
+
+# =========================================================
+# APPLICATION
+# =========================================================
+
+def build_application():
+    init_db()
+
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .build()
+    )
+
+    # START
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    # ADMIN
+    application.add_handler(
+        CommandHandler("admin", admin_panel)
+    )
+
+    # LANGUAGE
+    application.add_handler(
+        CallbackQueryHandler(
+            language_callback,
+            pattern=r"^lang_(kk|ru)$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            settings_language,
+            pattern=r"^setlang_(kk|ru)$"
+        )
+    )
+
+    # SELLER CONVERSATION
+    seller_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(
+                filters.Regex("^🧑‍💼 САТУШЫ / ЖАЛҒА БЕРУШІ$"),
+                seller_start
+            )
+        ],
+        states={
+            SELL_TYPE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_type)
+            ],
+            SELL_CITY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_city)
+            ],
+            SELL_ROOMS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_rooms)
+            ],
+            SELL_ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_address)
+            ],
+            SELL_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_price)
+            ],
+            SELL_ALLOWED: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_allowed)
+            ],
+            SELL_FORBIDDEN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_forbidden)
+            ],
+            SELL_PHOTOS: [
+                MessageHandler(filters.PHOTO, seller_photos),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_photos)
+            ],
+            SELL_VIDEO: [
+                MessageHandler(filters.VIDEO, seller_video),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_video)
+            ],
+            SELL_PHONE: [
+                MessageHandler(
+                    filters.CONTACT | (filters.TEXT & ~filters.COMMAND),
+                    seller_phone
+                )
+            ],
+            SELL_EXTRA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_extra)
+            ],
+        },
+        fallbacks=[],
+        allow_reentry=True
+    )
+
+    application.add_handler(seller_conv)
+
+    # SEARCH CONVERSATION
+    search_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(
+                filters.Regex("^🏠 ПӘТЕР ІЗДЕУ$"),
+                search_start
+            )
+        ],
+        states={
+            SEARCH_TYPE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, search_type)
+            ],
+            SEARCH_CITY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, search_city)
+            ],
+        },
+        fallbacks=[],
+        allow_reentry=True
+    )
+
+    application.add_handler(search_conv)
+
+    # ROOMMATE CONVERSATION
+    roommate_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(
+                filters.Regex("^👥 БІРГЕ ПӘТЕР ІЗДЕУ$"),
+                roommate_menu
+            )
+        ],
+        states={
+            ROOM_CITY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, roommate_city)
+            ],
+            ROOM_AGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, roommate_age)
+            ],
+            ROOM_BUDGET: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, roommate_budget)
+            ],
+            ROOM_EXTRA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, roommate_extra)
+            ],
+        },
+        fallbacks=[],
+        allow_reentry=True
+    )
+
+    application.add_handler(roommate_conv)
+
+    # CALLBACKS
+    application.add_handler(
+        CallbackQueryHandler(
+            publish_listing,
+            pattern=r"^listing_publish$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            cancel_listing,
+            pattern=r"^listing_cancel$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            listing_skip,
+            pattern=r"^listing_skip$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            listing_save,
+            pattern=r"^listing_save$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            listing_select,
+            pattern=r"^listing_select$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            publish_roommate,
+            pattern=r"^room_publish$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            cancel_roommate,
+            pattern=r"^room_cancel$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            room_skip,
+            pattern=r"^room_skip$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            room_save,
+            pattern=r"^room_save$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            room_select,
+            pattern=r"^room_select$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            rate_user,
+            pattern=r"^rate_"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            report_callback,
+            pattern=r"^report_"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_callback,
+            pattern=r"^admin_"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            renew_listing,
+            pattern=r"^renew_"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            delete_expired,
+            pattern=r"^delete_expired_"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            renew_roommate,
+            pattern=r"^renewroom_"
+        )
+    )
+
+    # MAIN MENU TEXT
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_router
+        )
+    )
+
+    # EXPIRATION CHECK
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            check_expired,
+            interval=3600,
+            first=30
+        )
+
+    return application
+
+
+# =========================================================
+# RUN
+# =========================================================
+
+if __name__ == "__main__":
+    app = build_application()
+
+    print("QAZAQ HOME BOT STARTED")
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
